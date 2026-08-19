@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -74,11 +75,24 @@ class Orchestrator:
         self._progressive = ProgressiveStrategy()
         self._predictive = PredictiveStrategy(initial_k=1.0)
 
+        # Provider and Event Queue
+        self.event_queue = queue.Queue()  # type: ignore[type-arg]
+        if self.provider_name == "plivo":
+            from app.providers.plivo import PlivoProvider
+            self.provider = PlivoProvider(event_queue=self.event_queue)
+        elif self.provider_name == "mock_b":
+            from app.providers.mock_b import MockProviderB
+            self.provider = MockProviderB(event_queue=self.event_queue)  # type: ignore[assignment]
+        else:
+            from app.providers.mock_a import MockProviderA
+            self.provider = MockProviderA(event_queue=self.event_queue)  # type: ignore[assignment]
+
         # Allocator + Safety
         self._allocator = CallAllocator(provider=provider_name)
         self._safety = SafetyController(allocator=self._allocator)
 
         self._thread: threading.Thread | None = None
+        self._pump_thread: threading.Thread | None = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -91,6 +105,14 @@ class Orchestrator:
             target=self._loop, daemon=True, name="orchestrator-tick"
         )
         self._thread.start()
+        
+        # Start event pump for mock providers
+        if self.provider_name != "plivo":
+            self._pump_thread = threading.Thread(
+                target=self._pump_events, daemon=True, name="orchestrator-pump"
+            )
+            self._pump_thread.start()
+            
         logger.info("Orchestrator started (mode=%s, interval=%.1fs)", self.mode, self.tick_interval)
 
     def stop(self) -> None:
@@ -98,7 +120,26 @@ class Orchestrator:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=self.tick_interval * 3)
+        if self._pump_thread is not None:
+            self._pump_thread.join(timeout=self.tick_interval * 3)
         logger.info("Orchestrator stopped at tick %d.", self._tick)
+
+    def _pump_events(self) -> None:
+        from app.events.ingestor import EventIngestor
+        ingestor = EventIngestor()
+        while self._running:
+            try:
+                event = self.event_queue.get(timeout=0.1)
+                db = SessionLocal()
+                try:
+                    ingestor.process(event, db)
+                finally:
+                    db.close()
+                self.event_queue.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logger.error("Event pump error: %s", e)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main loop
@@ -152,7 +193,31 @@ class Orchestrator:
 
             # 6. Dial authorized count.
             if decision.authorized > 0:
-                self._safety.execute_dials(decision.authorized, db, self._worker_id)
+                dialled = self._safety.execute_dials(decision.authorized, db, self._worker_id)
+                # Initiate the actual telecom calls for any newly RESERVED calls
+                if dialled > 0:
+                    reserved_calls = db.query(Call).filter(Call.status == "RESERVED").all()
+                    for call in reserved_calls:
+                        call.status = "INITIATED"
+                        db.flush()
+                        
+                        # Dynamically get provider
+                        if self.provider_name == "plivo":
+                            from app.providers.plivo import PlivoProvider
+                            provider = PlivoProvider()
+                        elif self.provider_name == "mock_b":
+                            from app.providers.mock_b import MockProviderB
+                            provider = MockProviderB()
+                        else:
+                            from app.providers.mock_a import MockProviderA
+                            provider = MockProviderA()
+                            
+                        # In real app, we'd fire this async or in a separate thread pool
+                        threading.Thread(
+                            target=provider.initiate_call,
+                            args=(call.id, call.borrower.phone),
+                            daemon=True
+                        ).start()
 
             # 7. Update EWMAs from recent DB events.
             self._update_ewmas(db)

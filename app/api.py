@@ -12,18 +12,22 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
+from datetime import datetime
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.orchestrator import Orchestrator
 from app.db import get_db, init_db
+from app.events.ingestor import EventIngestor
 from app.models import Agent, Borrower, PacingDecision
+from app.providers.base import CallEvent
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount dashboard directory
+dashboard_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard")
+app.mount("/dashboard", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
+
 # Module-level orchestrator instance (one per process).
 _orchestrator: Optional[Orchestrator] = None
 
@@ -63,7 +71,7 @@ def _startup() -> None:
 
 class CampaignStartRequest(BaseModel):
     mode: str = Field("progressive", pattern="^(progressive|predictive)$")
-    provider: str = Field("mock_a", pattern="^(mock_a|mock_b)$")
+    provider: str = Field("mock_a", pattern="^(mock_a|mock_b|plivo)$")
     num_agents: int = Field(5, ge=1, le=10_000)
     num_borrowers: int = Field(20, ge=1, le=100_000)
     answer_rate: float = Field(0.5, ge=0.0, le=1.0)
@@ -225,3 +233,63 @@ async def ws_metrics(websocket: WebSocket) -> None:
             await websocket.send_json(metrics)
     except WebSocketDisconnect:
         logger.debug("WebSocket client disconnected from /ws/metrics")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Webhooks
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/webhooks/plivo", summary="Plivo Callbacks", tags=["Webhooks"])
+async def plivo_webhook(request: Request, db: Session = Depends(get_db)):
+    """Translate Plivo webhook events into CallEvent and run through the Ingestor."""
+    # Note: Depending on method configured in Plivo, could be form data or JSON.
+    content_type = request.headers.get("content-type", "")
+    
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+        
+    # We passed call_id in the query string of the answer/fallback URL
+    call_id = request.query_params.get("call_id")
+    if not call_id:
+        # Check payload
+        call_id = payload.get("call_id")
+
+    if not call_id:
+        logger.warning("Plivo webhook missing call_id: %s", payload)
+        return {"status": "ignored"}
+
+    status = payload.get("CallStatus", payload.get("Event", "")).lower()
+    event_type = None
+
+    if status in ("ringing", "in-progress"):
+        event_type = "RINGING"
+    elif status == "answered" or payload.get("MachineDetection") == "human":
+        event_type = "ANSWERED"
+    elif status == "completed":
+        event_type = "COMPLETED"
+    elif status in ("failed", "busy", "no-answer", "canceled", "rejected"):
+        event_type = "FAILED"
+
+    if event_type:
+        ingestor = EventIngestor()
+        # Create a CallEvent
+        # In a real production system we'd use a unique ID from Plivo for idempotency,
+        # such as CallUUID + status
+        event_id = f"{payload.get('CallUUID', 'unknown')}-{event_type}"
+        
+        event = CallEvent(
+            call_id=call_id,
+            event_type=event_type,
+            timestamp=datetime.utcnow(),
+            event_id=event_id,
+        )
+        
+        # Process the event synchronously since the ingestor uses SQLAlchemy sync engine
+        result = ingestor.process(event, db)
+        logger.info("Processed Plivo event %s for call %s: %s", event_type, call_id, result)
+        
+    return {"status": "ok"}
+

@@ -38,31 +38,20 @@ class Simulator:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.scenario = SCENARIOS[args.scenario]
-        
-        self.event_queue: queue.Queue = queue.Queue()  # type: ignore[type-arg]
-        self.ingestor = EventIngestor()
-        
-        if args.provider == "b":
-            self.provider: TelecomProvider = MockProviderB(
-                answer_rate=self.scenario.answer_rate,
-                talk_time_mean=self.scenario.talk_time_mean,
-                event_queue=self.event_queue,
-            )
-        else:
-            self.provider = MockProviderA(
-                answer_rate=self.scenario.answer_rate,
-                talk_time_mean=self.scenario.talk_time_mean,
-                event_queue=self.event_queue,
-            )
             
         self.orchestrator = Orchestrator(
             mode=args.mode,
-            provider_name=self.provider.name,
+            provider_name=args.provider,
             tick_interval=0.5,  # Faster ticks for simulation
         )
+        
+        # Override mock provider settings from scenario
+        if hasattr(self.orchestrator.provider, "answer_rate"):
+            self.orchestrator.provider.answer_rate = self.scenario.answer_rate
+        if hasattr(self.orchestrator.provider, "talk_time_mean"):
+            self.orchestrator.provider.talk_time_mean = self.scenario.talk_time_mean
 
         self._running = False
-        self._provider_thread: threading.Thread | None = None
         self._chaos_thread: threading.Thread | None = None
         self._stats_thread: threading.Thread | None = None
 
@@ -92,10 +81,6 @@ class Simulator:
         
         self._running = True
         self.orchestrator.start()
-        
-        # Start event pump
-        self._provider_thread = threading.Thread(target=self._pump_events, daemon=True)
-        self._provider_thread.start()
 
         # Start stats printer
         self._stats_thread = threading.Thread(target=self._print_stats, daemon=True)
@@ -126,34 +111,6 @@ class Simulator:
         self._running = False
         self.orchestrator.stop()
         self._print_final_summary()
-
-    def _pump_events(self) -> None:
-        """Poll the provider queue and ingest events."""
-        while self._running:
-            try:
-                event = self.event_queue.get(timeout=0.1)
-                db = SessionLocal()
-                try:
-                    self.ingestor.process(event, db)
-                finally:
-                    db.close()
-                self.event_queue.task_done()
-                
-                # Check for calls that need initiating (simulate dialer pushing to provider)
-                # In a real system, the orchestrator/allocator would trigger this directly,
-                # but for decoupling, we poll INITIATED calls here.
-                db = SessionLocal()
-                calls = db.query(Call).filter(Call.status == "RESERVED").all()
-                for c in calls:
-                    c.status = "INITIATED"
-                    db.commit()
-                    self.provider.initiate_call(c.id, c.borrower.phone)
-                db.close()
-                
-            except queue.Empty:
-                pass
-            except Exception as e:
-                print(f"Error pumping events: {e}")
 
     def _print_stats(self) -> None:
         """Print a live table of metrics every tick."""

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartDialer Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            margin: 0;
+            padding: 20px;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #333;
+        }
+        .header h1 {
+            margin: 0;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background-color: #1e1e1e;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            text-align: center;
+        }
+        .card h3 {
+            margin: 0 0 10px 0;
+            color: #888;
+            font-size: 14px;
+            text-transform: uppercase;
+        }
+        .card .value {
+            font-size: 32px;
+            font-weight: bold;
+        }
+        .chart-container {
+            background-color: #1e1e1e;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            height: 400px;
+        }
+        .status-dot {
+            height: 15px;
+            width: 15px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 10px;
+        }
+        .status-dot.connected { background-color: #4caf50; }
+        .status-dot.disconnected { background-color: #f44336; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>SmartDialer Live Dashboard</h1>
+        <div>
+            <span id="ws-status" class="status-dot disconnected"></span>
+            <span id="ws-text">Disconnected</span>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>Mode</h3>
+            <div id="metric-mode" class="value">-</div>
+        </div>
+        <div class="card">
+            <h3>Tick</h3>
+            <div id="metric-tick" class="value">0</div>
+        </div>
+        <div class="card">
+            <h3>Avail / Busy Agents</h3>
+            <div id="metric-agents" class="value">0 / 0</div>
+        </div>
+        <div class="card">
+            <h3>Connected Calls</h3>
+            <div id="metric-connected" class="value">0</div>
+        </div>
+        <div class="card">
+            <h3>Abandon Rate</h3>
+            <div id="metric-abandon" class="value">0.0%</div>
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="metricsChart"></canvas>
+    </div>
+
+    <script>
+        // Setup Chart.js
+        Chart.defaults.color = '#888';
+        const ctx = document.getElementById('metricsChart').getContext('2d');
+        const metricsChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Available Agents',
+                        borderColor: '#4caf50',
+                        backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                        data: [],
+                        yAxisID: 'y',
+                    },
+                    {
+                        label: 'Connected Calls',
+                        borderColor: '#2196f3',
+                        backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                        data: [],
+                        yAxisID: 'y',
+                    },
+                    {
+                        label: 'Abandon Rate (%)',
+                        borderColor: '#f44336',
+                        backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                        data: [],
+                        yAxisID: 'y1',
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                scales: {
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        min: 0,
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        min: 0,
+                        max: 10, // 10% max for better visibility around 3% threshold
+                        grid: { drawOnChartArea: false },
+                    }
+                }
+            }
+        });
+
+        // WebSocket Connection
+        let ws;
+        function connect() {
+            // Determine WS URL based on current host
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/metrics`;
+            
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                document.getElementById('ws-status').className = 'status-dot connected';
+                document.getElementById('ws-text').innerText = 'Live';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-status').className = 'status-dot disconnected';
+                document.getElementById('ws-text').innerText = 'Disconnected - Reconnecting...';
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket error", err);
+                ws.close();
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.error) {
+                        console.log("Server message:", data.error);
+                        return;
+                    }
+                    updateDashboard(data);
+                } catch (e) {
+                    console.error("Failed to parse WS message", e);
+                }
+            };
+        }
+
+        const maxDataPoints = 60;
+
+        function updateDashboard(data) {
+            // Update cards
+            document.getElementById('metric-mode').innerText = data.mode.toUpperCase();
+            document.getElementById('metric-tick').innerText = data.tick;
+            document.getElementById('metric-agents').innerText = `${data.agents.available} / ${data.agents.busy}`;
+            document.getElementById('metric-connected').innerText = data.calls.connected;
+            
+            const abandonPct = (data.calls.abandon_rate * 100).toFixed(1);
+            const abandonEl = document.getElementById('metric-abandon');
+            abandonEl.innerText = `${abandonPct}%`;
+            abandonEl.style.color = abandonPct > 3.0 ? '#f44336' : '#ffffff';
+
+            // Update chart
+            metricsChart.data.labels.push(data.tick);
+            metricsChart.data.datasets[0].data.push(data.agents.available);
+            metricsChart.data.datasets[1].data.push(data.calls.connected);
+            metricsChart.data.datasets[2].data.push(data.calls.abandon_rate * 100);
+
+            if (metricsChart.data.labels.length > maxDataPoints) {
+                metricsChart.data.labels.shift();
+                metricsChart.data.datasets.forEach(dataset => dataset.data.shift());
+            }
+
+            metricsChart.update();
+        }
+
+        // Initialize
+        connect();
+    </script>
+</body>
+</html>
