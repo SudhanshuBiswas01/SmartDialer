@@ -199,6 +199,19 @@ class Orchestrator:
                     reserved_calls = db.query(Call).filter(Call.status == "RESERVED").all()
                     for call in reserved_calls:
                         call.status = "INITIATED"
+                        
+                        # Transition agent from RESERVED to DIALING
+                        agent = db.get(Agent, call.agent_id)
+                        if agent:
+                            from app.domain import agent_fsm
+                            try:
+                                agent.status = agent_fsm.apply(
+                                    agent_fsm.AgentState(agent.status),
+                                    agent_fsm.AgentState.DIALING
+                                ).value
+                            except Exception as exc:
+                                logger.error("Failed to transition agent %s to DIALING: %s", agent.id, exc)
+                        
                         db.flush()
                         
                         # Use the already instantiated provider
