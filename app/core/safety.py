@@ -65,8 +65,9 @@ class SafetyController:
                    Kept private; only SafetyController calls it.
     """
 
-    def __init__(self, allocator) -> None:  # type: ignore[type-arg]
+    def __init__(self, allocator, campaign_id: str | None = None) -> None:  # type: ignore[type-arg]
         self._allocator = allocator
+        self.campaign_id = campaign_id
 
     # ─────────────────────────────────────────────────────────────────────────
     # Primary gate
@@ -174,6 +175,7 @@ class SafetyController:
         Flushed (not committed) — the caller controls the transaction boundary.
         """
         row = PacingDecision(
+            campaign_id=self.campaign_id,
             tick=snapshot.tick,
             mode=snapshot.mode,
             proposed=proposal,

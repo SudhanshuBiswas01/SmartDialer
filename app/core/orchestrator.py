@@ -95,8 +95,8 @@ class Orchestrator:
             self.provider = MockProviderA(event_queue=self.event_queue)  # type: ignore[assignment]
 
         # Allocator + Safety
-        self._allocator = CallAllocator(provider=provider_name)
-        self._safety = SafetyController(allocator=self._allocator)
+        self._allocator = CallAllocator(provider=provider_name, campaign_id=campaign_id)
+        self._safety = SafetyController(allocator=self._allocator, campaign_id=campaign_id)
 
         self._thread: threading.Thread | None = None
         self._pump_thread: threading.Thread | None = None

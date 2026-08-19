@@ -74,13 +74,15 @@ class CallAllocator:
     caller controls transaction boundaries.
     """
 
-    def __init__(self, provider: str = "mock_a") -> None:
+    def __init__(self, provider: str = "mock_a", campaign_id: str | None = None) -> None:
         """Initialise the allocator.
 
         Args:
             provider: Name of the telecom provider to record on new call rows.
+            campaign_id: UUID of the active campaign.
         """
         self.provider = provider
+        self.campaign_id = campaign_id
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -164,9 +166,11 @@ class CallAllocator:
         lease_until = now + timedelta(seconds=LEASE_TTL_SECONDS)
 
         # ── Step 1: pick the longest-waiting AVAILABLE agent ─────────────────
+        q_agent = db.query(Agent).filter(Agent.status == "AVAILABLE")
+        if self.campaign_id:
+            q_agent = q_agent.filter(Agent.campaign_id == self.campaign_id)
         agent = (
-            db.query(Agent)
-            .filter(Agent.status == "AVAILABLE")
+            q_agent
             .order_by(Agent.updated_at.asc())
             .with_for_update(skip_locked=True)
             .first()
@@ -203,9 +207,11 @@ class CallAllocator:
         agent.lease_expires_at = lease_until
 
         # ── Step 3: pick the oldest PENDING borrower ──────────────────────────
+        q_borrower = db.query(Borrower).filter(Borrower.status == "PENDING")
+        if self.campaign_id:
+            q_borrower = q_borrower.filter(Borrower.campaign_id == self.campaign_id)
         borrower = (
-            db.query(Borrower)
-            .filter(Borrower.status == "PENDING")
+            q_borrower
             .order_by(Borrower.last_attempt_at.asc().nullsfirst(), Borrower.id.asc())
             .with_for_update(skip_locked=True)
             .first()
@@ -241,6 +247,7 @@ class CallAllocator:
         call_id = str(uuid.uuid4())
         call = Call(
             id=call_id,
+            campaign_id=self.campaign_id,
             agent_id=agent.id,
             borrower_id=borrower.id,
             provider=self.provider,
