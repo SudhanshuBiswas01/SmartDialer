@@ -24,3 +24,8 @@
 ## 5. Strict Separation of Pacing and Safety
 **What:** Pacing strategies are pure mathematical functions that output a proposed dial count. The `SafetyController` is the only entity allowed to actually command the allocator.
 **Why:** Prevents "smart" predictive algorithms from accidentally violating compliance. The SafetyController enforces the 3% abandon rate cap and provider circuit breakers as hard, un-bypassable rules.
+
+## 6. Workers = Processes
+**What:** Worker threads in this architecture stand in for separate worker processes. Correctness relies entirely on atomic conditional database updates (optimistic concurrency control), rather than in-memory locks or thread-level coordination.
+**Why:** This design guarantees that the exact same code runs correctly and safely as `N` completely independent, horizontally scaled processes (e.g. running across multiple containers against a central PostgreSQL database).
+**Proof:** We cite the `test_multi_instance` integration test, which spins up concurrent, isolated database connections to mimic completely independent worker processes racing for allocations without causing double bookings.
