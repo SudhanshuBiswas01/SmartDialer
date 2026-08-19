@@ -201,16 +201,8 @@ class Orchestrator:
                         call.status = "INITIATED"
                         db.flush()
                         
-                        # Dynamically get provider
-                        if self.provider_name == "plivo":
-                            from app.providers.plivo import PlivoProvider
-                            provider = PlivoProvider()
-                        elif self.provider_name == "mock_b":
-                            from app.providers.mock_b import MockProviderB
-                            provider = MockProviderB()
-                        else:
-                            from app.providers.mock_a import MockProviderA
-                            provider = MockProviderA()
+                        # Use the already instantiated provider
+                        provider = self.provider
                             
                         # In real app, we'd fire this async or in a separate thread pool
                         threading.Thread(
@@ -218,6 +210,7 @@ class Orchestrator:
                             args=(call.id, call.borrower.phone),
                             daemon=True
                         ).start()
+                    db.commit()
 
             # 7. Update EWMAs from recent DB events.
             self._update_ewmas(db)
