@@ -11,6 +11,8 @@ Key design decisions:
   for duplicate events from unreliable telecom providers.
 - ``pacing_decisions`` provides a full audit trail so every dial decision can
   be reconstructed and explained after the fact.
+- ``campaigns`` tracks campaign lifecycle (RUNNING/STOPPED/COMPLETED) and ties
+  all agents, borrowers, calls, and pacing decisions to a single campaign_id.
 """
 
 from __future__ import annotations
@@ -46,6 +48,35 @@ class Base(DeclarativeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Campaigns
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Campaign(Base):
+    """Tracks a single dialling campaign lifecycle.
+
+    Status lifecycle: RUNNING → STOPPED | COMPLETED.
+    """
+
+    __tablename__ = "campaigns"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="RUNNING", index=True
+    )
+    """RUNNING | STOPPED | COMPLETED."""
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    """'progressive' or 'predictive'."""
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    agents: Mapped[list["Agent"]] = relationship("Agent", back_populates="campaign")
+    borrowers: Mapped[list["Borrower"]] = relationship("Borrower", back_populates="campaign")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Agents
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,6 +86,10 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    campaign_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("campaigns.id"), nullable=True, index=True
+    )
+    """FK to the campaign this agent belongs to. Nullable for test compatibility."""
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="OFFLINE", index=True
     )
@@ -78,6 +113,7 @@ class Agent(Base):
         DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
+    campaign: Mapped["Campaign | None"] = relationship("Campaign", back_populates="agents")
     calls: Mapped[list["Call"]] = relationship("Call", back_populates="agent")
 
 
@@ -94,6 +130,10 @@ class Borrower(Base):
     __tablename__ = "borrowers"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    campaign_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("campaigns.id"), nullable=True, index=True
+    )
+    """FK to the campaign this borrower belongs to. Nullable for test compatibility."""
     phone: Mapped[str] = mapped_column(String(30), nullable=False)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING", index=True
@@ -102,6 +142,7 @@ class Borrower(Base):
     """Number of dial attempts so far (incremented by the reconciler on retry)."""
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    campaign: Mapped["Campaign | None"] = relationship("Campaign", back_populates="borrowers")
     calls: Mapped[list["Call"]] = relationship("Call", back_populates="borrower")
 
 
@@ -115,6 +156,10 @@ class Call(Base):
     __tablename__ = "calls"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    campaign_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("campaigns.id"), nullable=True, index=True
+    )
+    """FK to the campaign this call belongs to. Nullable for test compatibility."""
     agent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agents.id"), nullable=True, index=True
     )
@@ -179,6 +224,10 @@ class PacingDecision(Base):
     __tablename__ = "pacing_decisions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("campaigns.id"), nullable=True, index=True
+    )
+    """FK to the campaign this decision belongs to. Nullable for test compatibility."""
     tick: Mapped[int] = mapped_column(Integer, nullable=False)
     mode: Mapped[str] = mapped_column(String(20), nullable=False)
     """'progressive' or 'predictive'."""

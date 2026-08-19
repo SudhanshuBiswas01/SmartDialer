@@ -1,12 +1,14 @@
 """Orchestrator — tick loop that drives the pacing/safety/allocation cycle.
 
 Every tick (default 1 s):
-1. Reconciler sweep — recover expired leases.
+1. Reconciler sweep — recover expired leases and zombie calls.
 2. Build Snapshot from DB counts and running EWMAs.
 3. Pacing strategy proposes a dial count.
 4. Safety Controller authorizes (and caps) the proposal.
 5. Allocator dials the authorized count.
 6. EWMA metrics are updated from DB events since last tick.
+7. Campaign completion check — if no dialable borrowers and no calls in flight,
+   mark campaign COMPLETED and stop the loop.
 
 N worker threads may run concurrently — correctness comes from the DB, not
 from thread-level coordination.  All shared state (EWMAs, k, tick counter) is
@@ -30,10 +32,10 @@ from app.core.allocator import CallAllocator
 from app.core.pacing.base import Snapshot
 from app.core.pacing.predictive import PredictiveStrategy
 from app.core.pacing.progressive import ProgressiveStrategy
-from app.core.reconciler import release_expired_leases
+from app.core.reconciler import release_expired_leases, sweep_zombie_calls
 from app.core.safety import SafetyController
 from app.db import SessionLocal
-from app.models import Agent, Borrower, Call, PacingDecision
+from app.models import Agent, Borrower, Call, Campaign, PacingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,8 @@ class Orchestrator:
         mode:          'progressive' or 'predictive'.
         provider_name: Name of the active telecom provider.
         tick_interval: Seconds between ticks (default 1.0).
+        campaign_id:   UUID of the active campaign row. All DB queries are
+                       scoped to this ID when provided.
     """
 
     def __init__(
@@ -56,15 +60,18 @@ class Orchestrator:
         mode: str = "progressive",
         provider_name: str = "mock_a",
         tick_interval: float = TICK_INTERVAL,
+        campaign_id: str | None = None,
     ) -> None:
         self.mode = mode
         self.provider_name = provider_name
         self.tick_interval = tick_interval
+        self.campaign_id = campaign_id
 
         self._lock = threading.Lock()
         self._running = False
         self._tick = 0
         self._worker_id = f"orchestrator-{uuid.uuid4().hex[:8]}"
+        self._campaign_status = "RUNNING"  # in-memory reflection of DB status
 
         # EWMA state (updated under _lock)
         self._ewma_answer_rate: float = 0.5
@@ -105,14 +112,14 @@ class Orchestrator:
             target=self._loop, daemon=True, name="orchestrator-tick"
         )
         self._thread.start()
-        
+
         # Start event pump for mock providers
         if self.provider_name != "plivo":
             self._pump_thread = threading.Thread(
                 target=self._pump_events, daemon=True, name="orchestrator-pump"
             )
             self._pump_thread.start()
-            
+
         logger.info("Orchestrator started (mode=%s, interval=%.1fs)", self.mode, self.tick_interval)
 
     def stop(self) -> None:
@@ -164,8 +171,9 @@ class Orchestrator:
                 self._tick += 1
                 tick = self._tick
 
-            # 1. Reconciler sweep.
+            # 1. Reconciler sweep — expired leases + zombie calls.
             release_expired_leases(db)
+            sweep_zombie_calls(db, campaign_id=self.campaign_id)
 
             # 2. Build Snapshot.
             snapshot = self._build_snapshot(db, tick)
@@ -196,10 +204,13 @@ class Orchestrator:
                 dialled = self._safety.execute_dials(decision.authorized, db, self._worker_id)
                 # Initiate the actual telecom calls for any newly RESERVED calls
                 if dialled > 0:
-                    reserved_calls = db.query(Call).filter(Call.status == "RESERVED").all()
+                    q = db.query(Call).filter(Call.status == "RESERVED")
+                    if self.campaign_id:
+                        q = q.filter(Call.campaign_id == self.campaign_id)
+                    reserved_calls = q.all()
                     for call in reserved_calls:
                         call.status = "INITIATED"
-                        
+
                         # Transition agent from RESERVED to DIALING
                         agent = db.get(Agent, call.agent_id)
                         if agent:
@@ -211,13 +222,11 @@ class Orchestrator:
                                 ).value
                             except Exception as exc:
                                 logger.error("Failed to transition agent %s to DIALING: %s", agent.id, exc)
-                        
+
                         db.flush()
-                        
-                        # Use the already instantiated provider
+
+                        # Fire the telecom call
                         provider = self.provider
-                            
-                        # In real app, we'd fire this async or in a separate thread pool
                         threading.Thread(
                             target=provider.initiate_call,
                             args=(call.id, call.borrower.phone),
@@ -228,6 +237,9 @@ class Orchestrator:
             # 7. Update EWMAs from recent DB events.
             self._update_ewmas(db)
 
+            # 8. Campaign completion check.
+            self._check_completion(db)
+
             logger.debug(
                 "Tick %d | mode=%s | proposed=%d | authorized=%d | reason=%s",
                 tick, snapshot.mode, proposed, decision.authorized, decision.reason,
@@ -235,16 +247,65 @@ class Orchestrator:
         finally:
             db.close()
 
+    def _check_completion(self, db: Session) -> None:
+        """Stop the campaign if no dialable borrowers remain and no calls are in flight."""
+        if not self._running or self.campaign_id is None:
+            return
+
+        # Count pending borrowers.
+        pending_q = db.query(Borrower).filter(Borrower.status == "PENDING")
+        pending_q = pending_q.filter(Borrower.campaign_id == self.campaign_id)
+        pending_count = pending_q.count()
+
+        # Count in-flight calls.
+        in_flight_statuses = {"INITIATED", "RINGING", "ANSWERED", "CONNECTED", "RESERVED", "QUEUED"}
+        in_flight_q = db.query(Call).filter(
+            Call.status.in_(in_flight_statuses),
+            Call.campaign_id == self.campaign_id,
+        )
+        in_flight_count = in_flight_q.count()
+
+        if pending_count == 0 and in_flight_count == 0:
+            logger.info(
+                "Campaign %s COMPLETED: no pending borrowers, no calls in flight.",
+                self.campaign_id,
+            )
+            # Mark campaign COMPLETED in DB.
+            campaign = db.get(Campaign, self.campaign_id)
+            if campaign is not None:
+                campaign.status = "COMPLETED"
+                campaign.stopped_at = datetime.utcnow()
+                db.commit()
+
+            with self._lock:
+                self._campaign_status = "COMPLETED"
+
+            # Stop the loop without joining (we're inside the loop thread).
+            self._running = False
+
     # ─────────────────────────────────────────────────────────────────────────
     # Snapshot construction
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_snapshot(self, db: Session, tick: int) -> Snapshot:
         """Query DB counts and assemble a Snapshot for this tick."""
-        available = db.query(Agent).filter(Agent.status == "AVAILABLE").count()
-        ringing = db.query(Call).filter(Call.status == "RINGING").count()
-        connected = db.query(Call).filter(Call.status == "CONNECTED").count()
-        answered = db.query(Call).filter(Call.status == "ANSWERED").count()
+        def _scope(q):
+            """Apply campaign_id filter if set."""
+            if self.campaign_id:
+                return q.filter(Call.campaign_id == self.campaign_id)
+            return q
+
+        def _agent_scope(q):
+            if self.campaign_id:
+                return q.filter(Agent.campaign_id == self.campaign_id)
+            return q
+
+        available = _agent_scope(
+            db.query(Agent).filter(Agent.status == "AVAILABLE")
+        ).count()
+        ringing = _scope(db.query(Call).filter(Call.status == "RINGING")).count()
+        connected = _scope(db.query(Call).filter(Call.status == "CONNECTED")).count()
+        answered = _scope(db.query(Call).filter(Call.status == "ANSWERED")).count()
 
         # Agents finishing soon (connected and past expected talk time).
         with self._lock:
@@ -256,19 +317,19 @@ class Orchestrator:
 
         threshold_secs = ewma_talk_time - ewma_setup_time
         threshold_dt = datetime.utcnow() - timedelta(seconds=threshold_secs)
-        frees_soon_query = (
-            db.query(Call)
-            .filter(Call.status == "CONNECTED", Call.answered_at < threshold_dt)
-            .count()
-        )
+        frees_soon_query = _scope(
+            db.query(Call).filter(Call.status == "CONNECTED", Call.answered_at < threshold_dt)
+        ).count()
 
         # Abandon rate in rolling window.
         window_start = datetime.utcnow() - timedelta(seconds=ABANDON_WINDOW_SECONDS)
-        recent_answered = db.query(Call).filter(
-            Call.answered_at > window_start
+        recent_answered = _scope(
+            db.query(Call).filter(Call.answered_at > window_start)
         ).count()
-        recent_abandoned = db.query(Call).filter(
-            Call.answered_at > window_start, Call.abandoned == True  # noqa: E712
+        recent_abandoned = _scope(
+            db.query(Call).filter(
+                Call.answered_at > window_start, Call.abandoned == True  # noqa: E712
+            )
         ).count()
         abandon_rate = (
             recent_abandoned / recent_answered if recent_answered > 0 else 0.0
@@ -298,15 +359,14 @@ class Orchestrator:
         """Update EWMA metrics from recently completed calls."""
         window_start = datetime.utcnow() - timedelta(seconds=ABANDON_WINDOW_SECONDS)
 
-        completed_calls = (
-            db.query(Call)
-            .filter(
-                Call.status.in_(["COMPLETED", "FAILED"]),
-                Call.ended_at > window_start,
-                Call.answered_at.is_not(None),
-            )
-            .all()
+        q = db.query(Call).filter(
+            Call.status.in_(["COMPLETED", "FAILED"]),
+            Call.ended_at > window_start,
+            Call.answered_at.is_not(None),
         )
+        if self.campaign_id:
+            q = q.filter(Call.campaign_id == self.campaign_id)
+        completed_calls = q.all()
 
         if not completed_calls:
             return
@@ -326,13 +386,17 @@ class Orchestrator:
                     )
 
         # Answer rate: answered / (answered + not_answered) in window.
-        total_initiated = db.query(Call).filter(
-            Call.created_at > window_start
-        ).count()
-        total_answered = db.query(Call).filter(
+        tq = db.query(Call).filter(Call.created_at > window_start)
+        aq = db.query(Call).filter(
             Call.created_at > window_start,
             Call.answered_at.is_not(None),
-        ).count()
+        )
+        if self.campaign_id:
+            tq = tq.filter(Call.campaign_id == self.campaign_id)
+            aq = aq.filter(Call.campaign_id == self.campaign_id)
+
+        total_initiated = tq.count()
+        total_answered = aq.count()
 
         if total_initiated > 0:
             observed_rate = total_answered / total_initiated
@@ -347,14 +411,30 @@ class Orchestrator:
 
     def get_metrics(self, db: Session) -> dict:
         """Return current system metrics for the API /metrics endpoint."""
-        total = db.query(Call).count()
-        connected = db.query(Call).filter(Call.status == "CONNECTED").count()
-        completed = db.query(Call).filter(Call.status == "COMPLETED").count()
-        failed = db.query(Call).filter(Call.status == "FAILED").count()
-        abandoned_count = db.query(Call).filter(Call.abandoned == True).count()  # noqa: E712
-        available = db.query(Agent).filter(Agent.status == "AVAILABLE").count()
-        busy = db.query(Agent).filter(
-            Agent.status.in_(["RESERVED", "DIALING", "CONNECTED", "WRAP_UP"])
+        def _cscope(q):
+            """Scope a Call query to this campaign."""
+            if self.campaign_id:
+                return q.filter(Call.campaign_id == self.campaign_id)
+            return q
+
+        def _ascope(q):
+            """Scope an Agent query to this campaign."""
+            if self.campaign_id:
+                return q.filter(Agent.campaign_id == self.campaign_id)
+            return q
+
+        total = _cscope(db.query(Call)).count()
+        connected = _cscope(db.query(Call).filter(Call.status == "CONNECTED")).count()
+        completed = _cscope(db.query(Call).filter(Call.status == "COMPLETED")).count()
+        failed = _cscope(db.query(Call).filter(Call.status == "FAILED")).count()
+        abandoned_count = _cscope(
+            db.query(Call).filter(Call.abandoned == True)  # noqa: E712
+        ).count()
+        available = _ascope(db.query(Agent).filter(Agent.status == "AVAILABLE")).count()
+        busy = _ascope(
+            db.query(Agent).filter(
+                Agent.status.in_(["RESERVED", "DIALING", "CONNECTED", "WRAP_UP"])
+            )
         ).count()
 
         with self._lock:
@@ -363,8 +443,11 @@ class Orchestrator:
             k = self._predictive.k
             tick = self._tick
             mode = self.mode
+            campaign_status = self._campaign_status
 
         return {
+            "campaign_id": self.campaign_id,
+            "campaign_status": campaign_status,
             "tick": tick,
             "mode": mode,
             "agents": {"available": available, "busy": busy},

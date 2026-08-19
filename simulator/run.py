@@ -77,7 +77,7 @@ class Simulator:
     def run(self) -> None:
         self.setup_db()
         print(f"[*] Starting scenario {self.scenario.name}: {self.scenario.description}")
-        print(f"[*] Provider: {self.provider.name}, Mode: {self.args.mode}")
+        print(f"[*] Provider: {self.orchestrator.provider_name}, Mode: {self.args.mode}")
         
         self._running = True
         self.orchestrator.start()
