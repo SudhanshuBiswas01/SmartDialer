@@ -78,3 +78,55 @@ When running `uvicorn app.api:app`, you can interact directly via HTTP:
 - **System Metrics:** `GET /metrics`
 - **Audit Log:** `GET /decisions` (Answers "why did the system dial X calls?")
 - **Live Feed:** `WS /ws/metrics` (Used by the dashboard)
+
+---
+
+## 🏗️ High Level Design (HLD)
+
+```mermaid
+graph TD
+    API[FastAPI Endpoints] --> |Starts/Stops| Orch[Orchestrator Tick Loop]
+    API --> |Reads| DB[(Database / SQLite WAL)]
+    
+    Orch --> Recon[Reconciler]
+    Orch --> Pacing[Pacing Strategy]
+    Orch --> Safety[Safety Controller]
+    
+    Recon --> |Cleans expired leases| DB
+    Pacing --> |Reads Snapshot| DB
+    Safety --> |Authorizes & Audits| DB
+    Safety --> |Triggers| Alloc[Call Allocator]
+    
+    Alloc --> |Optimistic Locks| DB
+    Alloc --> |Initiates| Prov[Telecom Provider]
+    
+    Prov --> |Emits Events| EQ[Event Queue]
+    EQ --> Ingest[Event Ingestor]
+    
+    Ingest --> |Checks idempotency| DB
+    Ingest --> |Validates transition| CallFSM[Call FSM]
+    Ingest --> |Validates transition| AgentFSM[Agent FSM]
+    Ingest --> |Updates State| DB
+```
+
+---
+
+## 📋 What to submit
+
+Keep the submission practical.
+We need:
+- working source code;
+- README with setup instructions;
+- architecture diagram;
+- agent state machine;
+- call state machine;
+- Progressive Dialer;
+- Predictive Pacing Engine;
+- Safety Controller;
+- mock telecom providers;
+- tests;
+- basic simulation;
+- basic load test;
+- short architecture decision document.
+
+The system should be reasonably easy for another engineer to run locally.
