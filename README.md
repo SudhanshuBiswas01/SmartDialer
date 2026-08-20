@@ -109,24 +109,3 @@ graph TD
     Ingest --> |Updates State| DB
 ```
 
----
-
-## 📋 What to submit
-
-Keep the submission practical.
-We need:
-- working source code;
-- README with setup instructions;
-- architecture diagram;
-- agent state machine;
-- call state machine;
-- Progressive Dialer;
-- Predictive Pacing Engine;
-- Safety Controller;
-- mock telecom providers;
-- tests;
-- basic simulation;
-- basic load test;
-- short architecture decision document.
-
-The system should be reasonably easy for another engineer to run locally.
